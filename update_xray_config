@@ -102,7 +102,7 @@ def make_vlessblock2_inbound(public_key: str, private_key: str, short_ids=None):
 
     return {
         "tag": "VLESSBLOCK2",
-        "port": 443,
+        "port": 8443,
         "listen": "0.0.0.0",
         "protocol": "vless",
         "settings": {
