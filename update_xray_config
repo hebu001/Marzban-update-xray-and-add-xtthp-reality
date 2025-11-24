@@ -1,0 +1,301 @@
+#!/usr/bin/env python3
+import json
+import subprocess
+import shutil
+import datetime
+import sys
+from pathlib import Path
+import re
+
+CONFIG_PATH = Path("/var/lib/marzban/xray_config.json")
+DOCKER_CONTAINER = "marzban-marzban-1"
+
+
+def load_config(path: Path):
+    if not path.exists():
+        print(f"Файл {path} не найден", file=sys.stderr)
+        sys.exit(1)
+    with path.open("r", encoding="utf-8") as f:
+        return json.load(f)
+
+
+def backup_config(path: Path) -> Path:
+    ts = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
+    backup_path = path.with_suffix(path.suffix + f".bak-{ts}")
+    shutil.copy2(path, backup_path)
+    return backup_path
+
+
+def find_inbound_index(inbounds, tag_value):
+    for i, ib in enumerate(inbounds):
+        if ib.get("tag") == tag_value:
+            return i
+    return None
+
+
+def get_private_key_from_vless_reality(inbound):
+    try:
+        return inbound["streamSettings"]["realitySettings"]["privateKey"]
+    except (KeyError, TypeError):
+        return None
+
+
+def get_shortids_from_vless_reality(inbound):
+    try:
+        return inbound["streamSettings"]["realitySettings"]["shortIds"]
+    except (KeyError, TypeError):
+        return None
+
+
+def get_public_key_from_docker(private_key: str) -> str:
+    """
+    Вызывает: docker exec marzban-marzban-1 xray x25519 -i "<private_key>"
+    и парсит строку 'Public key: ...'
+    """
+    try:
+        result = subprocess.run(
+            ["docker", "exec", DOCKER_CONTAINER, "xray", "x25519", "-i", private_key],
+            check=True,
+            text=True,
+            capture_output=True,
+        )
+    except FileNotFoundError:
+        print("Команда docker не найдена. Установите docker или поправьте путь.", file=sys.stderr)
+        sys.exit(1)
+    except subprocess.CalledProcessError as e:
+        print("Ошибка при выполнении docker exec:", file=sys.stderr)
+        print(e.stderr, file=sys.stderr)
+        sys.exit(1)
+
+    stdout = result.stdout.strip()
+    # Ожидаемый формат:
+    # Private key: <...>
+    # Public key:  <...>
+    pub_key = None
+    for line in stdout.splitlines():
+        line_stripped = line.strip()
+        # Ищем строку, начинающуюся с 'Public key:' (регистр игнорируем)
+        if line_stripped.lower().startswith("public key:"):
+            # Берём всё после двоеточия
+            parts = line_stripped.split(":", 1)
+            if len(parts) == 2:
+                pub_key = parts[1].strip()
+                break
+
+    # Если по какой-то причине формат другой — как запасной вариант пробуем по regex
+    if not pub_key:
+        m = re.search(r"Public key:\s*([A-Za-z0-9_\-]{20,})", stdout, re.IGNORECASE)
+        if m:
+            pub_key = m.group(1)
+
+    if not pub_key:
+        print("Не удалось распарсить publicKey из вывода команды xray x25519:", file=sys.stderr)
+        print(stdout, file=sys.stderr)
+        sys.exit(1)
+
+    return pub_key
+
+
+def make_vlessblock2_inbound(public_key: str, private_key: str, short_ids=None):
+    if short_ids is None:
+        short_ids = [""]
+
+    return {
+        "tag": "VLESSBLOCK2",
+        "port": 443,
+        "listen": "0.0.0.0",
+        "protocol": "vless",
+        "settings": {
+            "clients": [],
+            "decryption": "none"
+        },
+        "sniffing": {
+            "enabled": True,
+            "routeOnly": False,
+            "destOverride": [
+                "http",
+                "tls",
+                "quic",
+                "fakedns"
+            ],
+            "metadataOnly": False
+        },
+        "streamSettings": {
+            "network": "xhttp",
+            "security": "reality",
+            "xhttpSettings": {
+                "host": "",
+                "mode": "auto",
+                "path": "/api/v3/userdata/sync",
+                "headers": {},
+                "noSSEHeader": False,
+                "xPaddingBytes": "100-1000"
+            },
+            "realitySettings": {
+                # Порядок ключей: сначала publicKey, потом privateKey
+                "publicKey": public_key,
+                "privateKey": private_key,
+                "dest": "vk.com:443",
+                "show": False,
+                "xver": 0,
+                "spiderX": "/",
+                "shortIds": short_ids,
+                "fingerprint": "chrome",
+                "serverNames": [
+                    "vk.com",
+                    "www.vk.com"
+                ]
+            }
+        }
+    }
+
+
+def update_all_inbounds_keys(inbounds, public_key: str, private_key: str):
+    """
+    Во всех ИНБАУНДАХ, где есть realitySettings.privateKey, выставляем
+    один и тот же publicKey / privateKey.
+    """
+    for ib in inbounds:
+        stream = ib.get("streamSettings")
+        if not isinstance(stream, dict):
+            continue
+        reality = stream.get("realitySettings")
+        if not isinstance(reality, dict):
+            continue
+
+        if "privateKey" in reality:
+            # Пересобираем словарь, чтобы publicKey был перед privateKey
+            new_reality = {}
+            new_reality["publicKey"] = public_key
+            new_reality["privateKey"] = private_key
+            for k, v in reality.items():
+                if k in ("publicKey", "privateKey"):
+                    continue
+                new_reality[k] = v
+            stream["realitySettings"] = new_reality
+
+
+def run_cmd(cmd, description: str):
+    print(f"\n==> Выполнение: {description}")
+    print("Команда:", " ".join(cmd))
+    try:
+        result = subprocess.run(cmd, text=True, capture_output=True, check=True)
+    except FileNotFoundError:
+        print(f"Команда не найдена: {cmd[0]}", file=sys.stderr)
+        sys.exit(1)
+    except subprocess.CalledProcessError as e:
+        print(f"Ошибка при выполнении команды: {description}", file=sys.stderr)
+        print("STDOUT:\n", e.stdout, file=sys.stderr)
+        print("STDERR:\n", e.stderr, file=sys.stderr)
+        sys.exit(1)
+
+    if result.stdout:
+        print("STDOUT:\n", result.stdout)
+    if result.stderr:
+        print("STDERR:\n", result.stderr)
+
+
+def run_cmd_with_input(cmd, description: str, stdin_str: str):
+    print(f"\n==> Выполнение (с вводом): {description}")
+    print("Команда:", " ".join(cmd))
+    try:
+        result = subprocess.run(
+            cmd,
+            text=True,
+            input=stdin_str,
+            capture_output=True,
+            check=True,
+        )
+    except FileNotFoundError:
+        print(f"Команда не найдена: {cmd[0]}", file=sys.stderr)
+        sys.exit(1)
+    except subprocess.CalledProcessError as e:
+        print(f"Ошибка при выполнении команды: {description}", file=sys.stderr)
+        print("STDOUT:\n", e.stdout, file=sys.stderr)
+        print("STDERR:\n", e.stderr, file=sys.stderr)
+        sys.exit(1)
+
+    if result.stdout:
+        print("STDOUT:\n", result.stdout)
+    if result.stderr:
+        print("STDERR:\n", result.stderr)
+
+
+def main():
+    config = load_config(CONFIG_PATH)
+    inbounds = config.get("inbounds")
+    if not isinstance(inbounds, list):
+        print("Поле 'inbounds' отсутствует или имеет неверный формат.", file=sys.stderr)
+        sys.exit(1)
+
+    # Находим индекс VLESS TCP REALITY
+    idx = find_inbound_index(inbounds, "VLESS TCP REALITY")
+    if idx is None:
+        print("Инбаунд с тегом 'VLESS TCP REALITY' не найден.", file=sys.stderr)
+        sys.exit(1)
+
+    vless_tcp_reality = inbounds[idx]
+
+    private_key = get_private_key_from_vless_reality(vless_tcp_reality)
+    if not private_key:
+        print("Не удалось найти privateKey в инбаунде 'VLESS TCP REALITY'.", file=sys.stderr)
+        sys.exit(1)
+
+    short_ids = get_shortids_from_vless_reality(vless_tcp_reality)
+
+    # Получаем publicKey из docker/xray
+    public_key = get_public_key_from_docker(private_key)
+
+    # Создаём новый инбаунд VLESSBLOCK2
+    new_inbound = make_vlessblock2_inbound(public_key, private_key, short_ids)
+
+    # Если уже есть VLESSBLOCK2, не дублируем, а только обновляем ключи
+    already_exists = False
+    for ib in inbounds:
+        if ib.get("tag") == "VLESSBLOCK2":
+            already_exists = True
+            stream = ib.get("streamSettings", {})
+            reality = stream.get("realitySettings", {})
+            new_reality = {
+                "publicKey": public_key,
+                "privateKey": private_key,
+            }
+            for k, v in reality.items():
+                if k in ("publicKey", "privateKey"):
+                    continue
+                new_reality[k] = v
+            stream["realitySettings"] = new_reality
+
+    if not already_exists:
+        # Вставляем НОВЫЙ инбаунд непосредственно ПЕРЕД "VLESS TCP REALITY"
+        inbounds.insert(idx, new_inbound)
+
+    # Обновляем ключи во всех инбаундах с realitySettings.privateKey
+    update_all_inbounds_keys(inbounds, public_key, private_key)
+
+    # Сохраняем изменения в xray_config.json
+    backup_path = backup_config(CONFIG_PATH)
+    with CONFIG_PATH.open("w", encoding="utf-8") as f:
+        json.dump(config, f, indent=2, ensure_ascii=False)
+
+    print("Конфигурация xray_config.json обновлена.")
+    print(f"Резервная копия файла: {backup_path}")
+    print(f"Private key: {private_key}")
+    print(f"Public  key: {public_key}")
+
+    # === ДОПОЛНИТЕЛЬНЫЕ КОМАНДЫ MARZBAN ===
+
+    # 1) marzban backup
+    run_cmd(["marzban", "backup"], "marzban backup")
+
+    # 2) marzban core-update с выбором пункта 1 (нажатие '1' и Enter)
+    run_cmd_with_input(["marzban", "core-update"], "marzban core-update (выбор 1)", "1\n")
+
+    # 3) marzban restart
+    run_cmd(["marzban", "restart"], "marzban restart")
+
+    print("\nВсе операции успешно выполнены.")
+
+
+if __name__ == "__main__":
+    main()
